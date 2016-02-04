@@ -865,7 +865,8 @@ def compareWriteAndReloadConfig(config, config_file):
         logger.info(
             "running config is different from generated config - reloading")
         if writeConfigAndValidate(config, config_file):
-            reloadConfig()
+            logger.warning("SKIPPING RELOAD BECAUSE I DISABLED IT")
+            #reloadConfig()
         else:
             logger.warning("skipping reload: config not valid")
 
@@ -877,17 +878,39 @@ def get_health_check(app, portIndex):
     return None
 
 
+def generateAlias(marathon_app, marathon_apps):
+    service = MarathonService(marathon_app.appId,0,None)
+    service.add_backend("dummy",1)
+    service.groups = marathon_app.groups
+    service.hostname = marathon_app.app['labels']['HAPROXY_VHOST']
+    target = marathon_app.app['labels']['HAPROXY_TARGET']
+    logger.debug('*** alias %s to target %s ***',service.hostname,target)
+    if not service.hostname:
+        return None
+    return service
+    # if service:
+    #     service.groups = marathon_app.groups
+    #     service.add_backend(task['host'], task_port)
+
 def get_apps(marathon):
     apps = marathon.list()
     logger.debug("got apps %s", [app["id"] for app in apps])
 
     marathon_apps = []
+
+    # Convert into a list for easier consumption
+    apps_list = list()
+
     for app in apps:
         appId = app['id']
         if appId[1:] == os.environ.get("FRAMEWORK_NAME"):
             continue
 
         marathon_app = MarathonApp(marathon, appId, app)
+
+        if 'HAPROXY_TYPE' in marathon_app.app['labels'] and 'alias' == marathon_app.app['labels']['HAPROXY_TYPE'].lower():
+            logger.debug("processing alias %s", marathon_app.appId)
+            apps_list.append( generateAlias(marathon_app, marathon_apps) )
 
         if 'HAPROXY_GROUP' in marathon_app.app['labels']:
             marathon_app.groups = \
@@ -942,8 +965,6 @@ def get_apps(marathon):
                     service.groups = marathon_app.groups
                     service.add_backend(task['host'], task_port)
 
-    # Convert into a list for easier consumption
-    apps_list = list()
     for marathon_app in marathon_apps:
         for service in list(marathon_app.services.values()):
             if service.backends:
@@ -989,6 +1010,7 @@ class MarathonEventProcessor(object):
 
     def handle_event(self, event):
         if event['eventType'] == 'status_update_event' or \
+                event['eventType'] == 'deployment_success' or \
                 event['eventType'] == 'health_status_changed_event':
             # TODO (cmaloney): Handle events more intelligently so we don't
             # unnecessarily hammer the Marathon API.
