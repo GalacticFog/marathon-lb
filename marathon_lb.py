@@ -410,6 +410,7 @@ class MarathonService(object):
         self.balance = 'roundrobin'
         self.healthCheck = healthCheck
         self.labels = {}
+        self.aliasFor = None
         if healthCheck:
             if healthCheck['protocol'] == 'HTTP':
                 self.mode = 'http'
@@ -551,6 +552,10 @@ def resolve_ip(host):
             return None
 
 
+def findTarget(app, apps):
+    return next((t for t in apps if t.appId == app.aliasFor or t.appId[1:] == app.aliasFor), None)
+
+
 def config(apps, groups, bind_http_https, ssl_certs, templater):
     logger.info("generating config")
     config = templater.haproxy_head
@@ -585,6 +590,26 @@ def config(apps, groups, bind_http_https, ssl_certs, templater):
         if app.hostname:
             app.mode = 'http'
 
+        # if a hostname is set we add the app to the vhost section
+        # of our haproxy config
+        # TODO(lloesche): Check if the hostname is already defined by another
+        # service
+        if bind_http_https:
+            if app.aliasFor:
+                target = findTarget(app, apps)
+                if target:
+                    logger.info('found target %s for alias %s', target.appId, app.appId)
+                    p_fe, s_fe = generateHttpAliasAcl(templater, app, target)
+                    http_frontends += p_fe
+                    https_frontends += s_fe
+                    continue
+                else:
+                    logger.warning('alias %s had non-existent target %s; ignoring',app.appId, app.aliasFor)
+            elif app.hostname:
+                p_fe, s_fe = generateHttpVhostAcl(templater, app, backend)
+                http_frontends += p_fe
+                https_frontends += s_fe
+
         frontend_head = templater.haproxy_frontend_head(app)
         frontends += frontend_head.format(
             bindAddr=app.bindAddr,
@@ -608,19 +633,11 @@ def config(apps, groups, bind_http_https, ssl_certs, templater):
             mode=app.mode
         )
 
-        # if a hostname is set we add the app to the vhost section
-        # of our haproxy config
-        # TODO(lloesche): Check if the hostname is already defined by another
-        # service
-        if bind_http_https and app.hostname:
-            p_fe, s_fe = generateHttpVhostAcl(templater, app, backend)
-            http_frontends += p_fe
-            https_frontends += s_fe
-
         # if app mode is http, we add the app to the second http frontend
         # selecting apps by http header X-Marathon-App-Id
         if app.mode == 'http' and \
-                app.appId not in apps_with_http_appid_backend:
+                app.appId not in apps_with_http_appid_backend and \
+                not app.aliasFor:
             logger.debug("adding virtual host for app with id %s", app.appId)
             # remember appids to prevent multiple entries for the same app
             apps_with_http_appid_backend += [app.appId]
@@ -777,6 +794,37 @@ def reloadConfig():
             logger.error("reload returned non-zero: %s", ex)
 
 
+def generateHttpAliasAcl(templater, app, target):
+    # If the hostname contains the delimiter ';', then the marathon app is
+    # requesting multiple hostname matches for the same backend, and we need
+    # to use alternate templates from the default one-acl/one-use_backend.
+    staging_http_frontends = ""
+    staging_https_frontends = ""
+
+    target_backend = target.appId[1:].replace('/', '_') + '_' + str(target.servicePort)
+
+    logger.debug(
+            "adding virtual host for app with hostname %s", app.hostname)
+    acl_name = re.sub(r'[^a-zA-Z0-9\-]', '_', app.hostname)
+
+    http_frontend_acl = templater.haproxy_http_frontend_acl(app)
+    staging_http_frontends += http_frontend_acl.format(
+            cleanedUpHostname=acl_name,
+            hostname=app.hostname,
+            appId=app.appId,
+            backend=target_backend
+    )
+
+    https_frontend_acl = templater.haproxy_https_frontend_acl(app)
+    staging_https_frontends += https_frontend_acl.format(
+            cleanedUpHostname=acl_name,
+            hostname=app.hostname,
+            appId=app.appId,
+            backend=target_backend
+    )
+
+    return (staging_http_frontends, staging_https_frontends)
+
 def generateHttpVhostAcl(templater, app, backend):
     # If the hostname contains the delimiter ';', then the marathon app is
     # requesting multiple hostname matches for the same backend, and we need
@@ -865,8 +913,7 @@ def compareWriteAndReloadConfig(config, config_file):
         logger.info(
             "running config is different from generated config - reloading")
         if writeConfigAndValidate(config, config_file):
-            logger.warning("SKIPPING RELOAD BECAUSE I DISABLED IT")
-            #reloadConfig()
+            reloadConfig()
         else:
             logger.warning("skipping reload: config not valid")
 
@@ -880,26 +927,24 @@ def get_health_check(app, portIndex):
 
 def generateAlias(marathon_app, marathon_apps):
     service = MarathonService(marathon_app.appId,0,None)
-    service.add_backend("dummy",1)
     service.groups = marathon_app.groups
     service.hostname = marathon_app.app['labels']['HAPROXY_VHOST']
-    target = marathon_app.app['labels']['HAPROXY_TARGET']
-    logger.debug('*** alias %s to target %s ***',service.hostname,target)
     if not service.hostname:
+        logger.debug('*** alias %s did not have HAPROXY_VHOST', service.appId)
         return None
+    target = marathon_app.app['labels']['HAPROXY_TARGET']
+    if not target:
+        logger.debug('*** alias %s did not have HAPROXY_TARGET', service.appId)
+        return None
+    service.aliasFor = target
+    logger.debug('*** alias %s on vhost %s to target %s ***',service.appId,service.hostname,service.aliasFor)
     return service
-    # if service:
-    #     service.groups = marathon_app.groups
-    #     service.add_backend(task['host'], task_port)
 
 def get_apps(marathon):
     apps = marathon.list()
     logger.debug("got apps %s", [app["id"] for app in apps])
 
     marathon_apps = []
-
-    # Convert into a list for easier consumption
-    apps_list = list()
 
     for app in apps:
         appId = app['id']
@@ -908,14 +953,18 @@ def get_apps(marathon):
 
         marathon_app = MarathonApp(marathon, appId, app)
 
-        if 'HAPROXY_TYPE' in marathon_app.app['labels'] and 'alias' == marathon_app.app['labels']['HAPROXY_TYPE'].lower():
-            logger.debug("processing alias %s", marathon_app.appId)
-            apps_list.append( generateAlias(marathon_app, marathon_apps) )
-
         if 'HAPROXY_GROUP' in marathon_app.app['labels']:
             marathon_app.groups = \
                 marathon_app.app['labels']['HAPROXY_GROUP'].split(',')
         marathon_apps.append(marathon_app)
+
+        if 'HAPROXY_TYPE' in marathon_app.app['labels'] and 'alias' == marathon_app.app['labels']['HAPROXY_TYPE'].lower():
+            if 0 != len(marathon_app.app['tasks']):
+                logger.debug('alias %s has running instances, treating as normal app', marathon_app.appId)
+            else:
+                logger.debug('*** processing alias %s ***', marathon_app.appId)
+                marathon_app.services[0] = generateAlias(marathon_app, marathon_apps)
+                continue
 
         service_ports = app['ports']
         for i in range(len(service_ports)):
@@ -965,9 +1014,13 @@ def get_apps(marathon):
                     service.groups = marathon_app.groups
                     service.add_backend(task['host'], task_port)
 
+    # Convert into a list for easier consumption
+    apps_list = list()
+
     for marathon_app in marathon_apps:
         for service in list(marathon_app.services.values()):
-            if service.backends:
+            # ignore if no backends unless it's an alias
+            if service.backends or service.aliasFor:
                 apps_list.append(service)
     return apps_list
 
