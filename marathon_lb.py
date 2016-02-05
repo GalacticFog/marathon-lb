@@ -928,16 +928,16 @@ def get_health_check(app, portIndex):
 def generateAlias(marathon_app, marathon_apps):
     service = MarathonService(marathon_app.appId,0,None)
     service.groups = marathon_app.groups
-    service.hostname = marathon_app.app['labels']['HAPROXY_VHOST']
-    if not service.hostname:
-        logger.debug('*** alias %s did not have HAPROXY_VHOST', service.appId)
+    if 'HAPROXY_VHOST' not in marathon_app.app['labels']:
+        logger.debug('alias %s did not have HAPROXY_VHOST', service.appId)
         return None
-    target = marathon_app.app['labels']['HAPROXY_TARGET']
-    if not target:
-        logger.debug('*** alias %s did not have HAPROXY_TARGET', service.appId)
+    service.hostname = marathon_app.app['labels']['HAPROXY_VHOST']
+    target = marathon_app.app['labels']['HAPROXY_ALIAS']
+    if not target or len(target.strip()) == 0:
+        logger.debug('alias %s did not have a target', service.appId)
         return None
     service.aliasFor = target
-    logger.debug('*** alias %s on vhost %s to target %s ***',service.appId,service.hostname,service.aliasFor)
+    logger.debug('alias %s on vhost %s to target %s',service.appId,service.hostname,service.aliasFor)
     return service
 
 def get_apps(marathon):
@@ -958,12 +958,14 @@ def get_apps(marathon):
                 marathon_app.app['labels']['HAPROXY_GROUP'].split(',')
         marathon_apps.append(marathon_app)
 
-        if 'HAPROXY_TYPE' in marathon_app.app['labels'] and 'alias' == marathon_app.app['labels']['HAPROXY_TYPE'].lower():
+        if 'HAPROXY_ALIAS' in marathon_app.app['labels']:
             if 0 != len(marathon_app.app['tasks']):
                 logger.debug('alias %s has running instances, treating as normal app', marathon_app.appId)
             else:
-                logger.debug('*** processing alias %s ***', marathon_app.appId)
-                marathon_app.services[0] = generateAlias(marathon_app, marathon_apps)
+                logger.debug('processing alias %s', marathon_app.appId)
+                srv = generateAlias(marathon_app, marathon_apps)
+                if srv:
+                    marathon_app.services[0] = srv
                 continue
 
         service_ports = app['ports']
