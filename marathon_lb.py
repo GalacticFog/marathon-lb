@@ -127,8 +127,9 @@ class ConfigTemplater(object):
 '''
 
     HAPROXY_HTTP_FRONTEND_ACL = '''\
-  acl host_{cleanedUpHostname} hdr(host) -i {hostname}
-  use_backend {backend} if host_{cleanedUpHostname}
+  acl host_{cleanedUpHostname}    hdr(host) -i {hostname}
+  acl host_{cleanedUpHostname}_80 hdr(host) -i {hostname}:80
+  use_backend {backend} if host_{cleanedUpHostname} or host_{cleanedUpHostname}_80 
 '''
 
     HAPROXY_HTTP_FRONTEND_APPID_ACL = '''\
